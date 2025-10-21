@@ -1,0 +1,357 @@
+---
+title: "Plots"
+output: html_notebook
+---
+# Plots Data Exploration
+
+Load Libraries
+```{r}
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(forcats)
+library(tidyr)
+library(stringr)
+library(purrr)
+```
+
+Global Variables
+```{r}
+path <- "C:/Users/carbi/Desktop/UNIVERSITA/MAGISTRALE/BOLOGNA/Erasmus/Tampere/Thesis/"
+
+nemesis <- c("BPA", "BPF", "BPS", "DEP (diethyl phthalate)", "DINP (di-isononyl phthalate)", "Hexamoll DINCH", "PFOA", "PFHxS", "ZEA")
+eu <- c("BPA", "BPB", "BPS", "BPAF", "para-nonylphenol", "Prochloraz", "Propiconazole", "Ziram", "4-(4-propan-2-yloxyphenyl)sulfonylphenol", "dibutyl phthalate", "lithium chloride", "di(2-ethylhexyl) phthalate", "triclosan", "TBBA")
+zenodo <- c('RU-486','Clobetasol', 'Dihydroxyvitamin-3','Dehydrorepiandrosterone',  'BPA','Genistein', 'Valproic Acid', 'Tamoxifen', 'Progesterone', 'Ketoconazole', 'Phenobarbital', 'Flutamide', 'Trenbolone', 'Griseofulvin', 'Methanol','Estradiol', 'Nicotine','Vinblastine', 'FK506/Cyclosporin A',  'diethylstilbestrol', 'Daidzein', 'Ethynyl estradiol', 'para-nonylphenol', 'BPS', 'BPF',  'Glyphosate', 'Roundup', 'BPAF', 'BPAP','BPB', 'BPZ', 'PPT', 'benzo[a]pyrene', 'Ethanol','TBBA','pendimethalin','stomp_aqua_pendimethalin', 'Reserpine', 'Thiram', 'Propiconazole','Cyproterone acetate', 'Bifenthrin', 'Trifloxystrobin', 'PFOA', 'Cycloheximide','Simazine', 'Cyproconazole', 'Simvastatin', 'Pyraclostrobin', 'PFOS', 'Triiodothyronine', 'Vinclozolin', '4-Hydroxytamoxifen', 'Maneb','Tetrac', 'Ziram','4-Cumylphenol', 'Lovastatin', 'Cyanazine', 'Fulvestrant', 'Nilutamide','Cypermethrin', 'Prochloraz', 'gesaprim', 'Imazalil', 'Rotenone','Dexamethasone', 'ZEA','TGSA', '4-(4-propan-2-yloxyphenyl)sulfonylphenol', 'BADGE')
+
+accepted_chemicals <- unique(c(nemesis, eu, zenodo))
+```
+
+
+### All the datasets
+
+Load the data
+```{r}
+data <- read_excel(paste0(path,"curated_ds/datasets.xlsx"))
+
+head(data)
+```
+
+Analysis of the Techniques
+
+```{r}
+technique_counts <- data %>%
+  count(Technique)%>%
+  arrange(desc(Technique)) %>%
+  mutate(
+    label = n,
+    ypos = cumsum(n) - n / 2
+  )
+
+p <- ggplot(technique_counts, aes(x = "", y = n, fill = Technique)) +
+  geom_col(color = "white") +
+  coord_polar(theta = "y") +
+  geom_text(aes(y = ypos, label = label), color = "black", size = 5) +
+  theme_void() +
+  scale_fill_brewer(palette = "Blues") +
+  labs(title = "Dataset count per Technique") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    plot.title.position = "plot"
+  )
+
+print(p)
+
+#ggsave(paste0(path, "immagini/technique_piechart_all.jpg"), plot = p)
+```
+Filter out the Techniques that I don't want
+```{r}
+data <- data %>% filter(Technique != "Others Array")
+```
+
+Analysis of the number of samples 
+
+Divided by technique
+```{r}
+p <- ggplot(data, aes(x = Technique, y = numeric_nsample)) +
+  geom_boxplot(fill = "#1f78b4") +
+  scale_y_log10() +
+  theme_minimal() +
+  labs(
+    title = "Sample Count by Technique",
+    x = "Technique",
+    y = "Number of Samples (log scale)"
+  )
+
+print(p)
+
+#ggsave(paste0(path, "immagini/numsamples_technique_all.jpg"), plot = p)
+```
+Divided by GSE (colored by technique)
+
+```{r}
+p <- ggplot(data %>% filter(Technique != "other"), 
+            aes(x = GSE, y = numeric_nsample, fill = Technique)) +
+  geom_boxplot() +
+  scale_y_log10() +
+  facet_wrap(~ Technique, scales = "free_x") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Blues") +
+  labs(
+    title = "Sample Count per GSE by Technique",
+    x = "GSE",
+    y = "Number of Samples (log scale)"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    legend.position = "none"
+  )
+
+print(p)
+
+#ggsave(paste0(path, "immagini/numsamples_GSE_all.jpg"), plot = p)
+```
+```{r}
+# Aggrega i dati: somma dei campioni per GSE e Technique
+my_blues <- c("#c6dbef", "#6baed6", "#2171b5", "#08306b")
+
+sample_counts <- data %>%
+  filter(Technique != "other") %>%
+  group_by(GSE, Technique) %>%
+  summarise(total_samples = sum(numeric_nsample, na.rm = TRUE), .groups = "drop")
+
+technique_levels <- unique(sample_counts$Technique)
+
+# Bar plot con facet per Technique
+p <- ggplot(sample_counts, aes(x = GSE, y = total_samples, fill = Technique)) +
+  geom_col() +
+  facet_wrap(~ Technique, scales = "free") +
+  scale_y_log10() +
+  scale_fill_manual(values = setNames(my_blues[1:length(technique_levels)], technique_levels)) +
+  theme_minimal() +
+  labs(
+    title = "Sample Count per GSE by Technique",
+    x = "GSE",
+    y = "Number of Samples"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    legend.position = "none"
+  )
+
+print(p)
+#ggsave(paste0(path, "immagini/numsamples_hist_GSE_all.jpg"), plot = p)
+```
+```{r}
+library(ggbreak)
+
+y_breaks <- c(seq(0, 400, by = 50), seq(700, 800, by = 50), seq(800, 5600, by = 50))
+
+p <- ggplot(sample_counts, aes(x = GSE, y = total_samples, fill = Technique)) +
+  geom_col() +
+  scale_y_continuous(
+    breaks = y_breaks
+  )+
+  scale_fill_manual(values = setNames(my_blues[1:length(technique_levels)], technique_levels)) +
+  theme_minimal() +
+  labs(
+    title = "Sample Count per GSE by Technique",
+    x = "GSE",
+    y = "Number of Samples"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    legend.position = "right"
+  ) +
+  scale_y_break(c(800, 5600))+
+  scale_y_break(c(400, 700))
+  
+
+print(p)
+
+```
+
+
+Analysis of the cell lines
+
+```{r}
+cell_line_counts <- data %>%
+  filter(cell_line != "") %>%              
+  separate_rows(cell_line, sep = ",\\s*") %>%
+  count(cell_line, name = "dataset_count") %>%
+  arrange(desc(dataset_count))
+
+p <- ggplot(cell_line_counts, aes(x = reorder(cell_line, dataset_count), y = dataset_count)) +
+  geom_bar(stat = "identity", fill = "#4c78a8") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Cell Line Frequency", x = "Cell Line", y = "Dataset Count")
+
+print(p)
+```
+```{r}
+data_long <- data %>%
+  filter(cell_line != "") %>%
+  separate_rows(cell_line, sep = ",\\s*")
+
+p <- ggplot(data_long, aes(x = reorder(cell_line, cell_line, function(x) length(x)), fill = Technique)) +
+  geom_bar(position = "stack") +
+  scale_fill_brewer(palette = "Blues") +
+  theme_minimal() +
+  labs(title = "Cell Line by Technique", x = "Cell Line", y = "Dataset Count") +
+  coord_flip()
+
+print(p)
+
+#ggsave(paste0(path, "immagini/cellLine_all.jpg"), plot = p)
+```
+Analysis of the chemicals 
+
+```{r}
+p <- data %>%
+  filter(test_chemical != "") %>%
+  separate_rows(test_chemical, sep = ",\\s*") %>% 
+  count(test_chemical, sort = TRUE) %>%
+  filter(test_chemical != "DMSO") %>%
+  filter(n > 1) %>%        # solo count > 1
+  ggplot(aes(x = reorder(test_chemical, n), y = n)) +
+  geom_bar(stat = "identity", fill = "#6baed6") +
+  theme_minimal() +
+  coord_flip() +
+  labs(title = "Chemicals Used (Count > 1)", x = "Chemical", y = "Dataset Count")
+
+print(p)
+
+#ggsave(paste0(path, "immagini/chemicals_all.jpg"), plot = p)
+```
+
+Analysis number of doses and number of time points
+
+Categorize exposure/dose into 4 groups and plot pie chart
+```{r}
+dose_exposure_cat <- data %>%
+  group_by(GSE) %>%
+  mutate(category = case_when(
+    doses == "multi" & exposure_time == "multi" ~ "Multi time and multi doses",
+    doses == "single" & exposure_time == "multi" ~ "Multi time and single dose",
+    doses == "multi" & exposure_time == "single" ~ "Single time and multi doses",
+    doses == "single" & exposure_time == "single" ~ "Single time and single dose",
+    TRUE ~ NA_character_
+  )) %>%
+  ungroup() %>%
+  filter(!is.na(category)) %>%
+  distinct(GSE, category)  # consider unique GSE-category pairs
+
+# Count datasets per category
+category_counts <- dose_exposure_cat %>%
+  count(category) %>%
+  arrange(desc(category)) %>%
+  mutate(prop = n / sum(n),
+         ypos = cumsum(prop) - 0.5 * prop)  # posizione etichette
+
+p <- ggplot(category_counts, aes(x = "", y = n, fill = category)) +
+  geom_col(color = "white") +
+  coord_polar(theta = "y") +
+  theme_void() +
+  scale_fill_brewer(palette = "Blues") +
+  geom_text(aes(y = ypos * sum(n), label = n), color = "black", size = 5) +
+  labs(title = "Number of time points and doses")+
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    plot.title.position = "plot"
+  )
+
+print(p)
+
+#ggsave(paste0(path, "immagini/timeDose_all.jpg"), plot = p)
+```
+
+### Only multi-dose datasets
+
+Load the data
+```{r}
+data <- read.csv(paste0(path,"/curated_ds/gse_df.csv"), stringsAsFactors = FALSE)
+
+head(data)
+```
+
+
+```{r}
+GSEs = c("GSE69851", "GSE50705", "GSE17624", "GSE86472", "GSE153320","GSE211183", "GSE249377")
+filtered_data <- data %>% filter(GSE %in% GSEs)
+```
+
+Heatmap Chemicals x GSE with number of doses
+```{r}
+chemical_dose_heatmap <- data %>%
+  filter(exposure != "") %>%
+  separate_rows(exposure, sep = ",\\s*") %>%
+  group_by(GSE, exposure) %>%
+  summarise(n_doses = n_distinct(dose.amount.), .groups = "drop")
+
+p <- ggplot(chemical_dose_heatmap, aes(x = GSE, y = exposure, fill = n_doses)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(
+    low = "#deebf7",
+    high = "#3182bd",
+    limits = c(3, max(chemical_dose_heatmap$n_doses, na.rm = TRUE)),
+    oob = scales::squish
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Number of Doses per Chemical per GSE",
+    x = "GSE",
+    y = "Chemical",
+    fill = "N. Doses"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p)
+
+#ggsave(paste0(path, "immagini/multiDose/heatmap.jpg"), plot = p)
+```
+```{r}
+technique_counts <- filtered_data %>%
+  count(Technique)%>%
+  arrange(desc(Technique)) %>%
+  mutate(
+    label = n,
+    ypos = cumsum(n) - n / 2
+  )
+
+p <- ggplot(technique_counts, aes(x = "", y = n, fill = Technique)) +
+  geom_col(color = "white") +
+  coord_polar(theta = "y") +
+  geom_text(aes(y = ypos, label = label), color = "black", size = 5) +
+  theme_void() +
+  scale_fill_brewer(palette = "Blues") +
+  labs(title = "Dataset count per Technique") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    plot.title.position = "plot"
+  )
+
+print(p)
+#ggsave(paste0(path, "immagini/multiDose/time_doses.jpg"), plot = p)
+```
+```{r}
+data_long <- filtered_data %>%
+  filter(test_chemical != "") %>%
+  separate_rows(test_chemical, sep = ",\\s*")
+
+p <- ggplot(data_long, aes(x = reorder(test_chemical, test_chemical, function(x) length(x)), fill = Technique)) +
+  geom_bar(position = "stack") +
+  scale_fill_brewer(palette = "Blues", direction = -1) +  # colori più scuri per migliori contrasti
+  theme_minimal() +
+  labs(
+    title = "Chemicals by Technique",
+    x = "Chemical",
+    y = "Dataset Count"
+  ) +
+  coord_flip() +
+  theme(
+    axis.text.y = element_text(size = 10),
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5)
+  )
+
+print(p)
+```
