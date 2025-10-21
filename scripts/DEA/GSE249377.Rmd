@@ -1,0 +1,1085 @@
+---
+title: "GSE249377_script"
+output: html_notebook
+---
+
+Read in the data
+```{r message = FALSE, warning = FALSE}
+library(readxl)
+library(dplyr)
+library(openxlsx)
+library("ggplot2")
+library("vsn")
+library("DESeq2")
+library(ggplot2)
+library(ggrepel)
+
+GSE <- "GSE249377"
+#dir <- paste0("/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/")
+#dir <- paste0("/project/hbp694/",GSE,"/")
+dir <- paste0("C:/Users/Utente/Desktop/denys/results/",GSE,"/")
+```
+
+```{r}
+meta_data <- read_excel("/project/hbp694/GSE249377/updated_GSE249377.xlsx", sheet = 1)
+
+raw_matrix <- read.table("/project/hbp694/GSE249377/GSE249377_mcf7_pilot_counts_2.csv", sep=",", stringsAsFactors=FALSE)
+
+```
+
+Modify the header of raw_matrix
+```{r}
+# modify the rownames: substitute everything that is after the _ with an empty string
+raw_matrix$V1 <- sub("_.*", "", raw_matrix$V1)
+
+# modify the colnames: use as colnmames the ones that were present in the raw table, not the one used when the table is uploaded
+colnames(raw_matrix)<- raw_matrix[1,]
+# remove the row with the names that was included in the table (and wasn't the header)
+raw_matrix <- raw_matrix[-1,]
+
+colnames(raw_matrix)[1] <- "Gene" 
+raw_matrix$Gene <- as.character(raw_matrix$Gene)
+```
+
+Put in the same order meta_data and raw_matrix looking at the column description of meta_data that contains the same names as the columns in raw_matrix
+```{r}
+meta_data$description <- paste(meta_data$assay_plate, meta_data$assay_plate_well, sep = "_")
+ordered_samples <- meta_data$description
+raw_matrix <- raw_matrix[, c("Gene", ordered_samples)]
+```
+
+Prepare the metadata
+```{r}
+meta_data$sample <- meta_data$title
+```
+
+First of all I remove all the samples that are not important for the analysis:
+- Reference compounds:genistein, trichostatin A, rapamycin
+- All the samples that have nothing in the exposure column: Universal_Human_Reference_RNA, Human_Brain_Reference_RNA, Lysis_Buffer, only media
+- All the chemicals that are not ED (otherwise the analysis is too heavy)
+```{r}
+
+nemesis <- c("BPA", "BPF", "BPS", "DEP (diethyl phthalate)", "DINP (di-isononyl phthalate)", "Hexamoll DINCH", "PFOA", "PFHxS", "ZEA")
+
+eu <- c("BPA", "BPB", "BPS", "BPAF", "para-nonylphenol", "Prochloraz", "Propiconazole", "Ziram", "4-(4-propan-2-yloxyphenyl)sulfonylphenol", "dibutyl phthalate", "lithium chloride", "di(2-ethylhexyl) phthalate", "triclosan", "TBBA")
+
+zenodo <- c('RU-486','Clobetasol', 'Dihydroxyvitamin-3','Dehydrorepiandrosterone',  'BPA','Genistein', 'Valproic Acid', 'Tamoxifen', 'Progesterone', 'Ketoconazole', 'Phenobarbital', 'Flutamide', 'Trenbolone', 'Griseofulvin', 'Methanol','Estradiol', 'Nicotine','Vinblastine', 'FK506/Cyclosporin A',  'diethylstilbestrol', 'Daidzein', 'Ethynyl estradiol', 'para-nonylphenol', 'BPS', 'BPF',  'Glyphosate', 'Roundup', 'BPAF', 'BPAP','BPB', 'BPZ', 'PPT', 'benzo[a]pyrene', 'Ethanol','TBBA','pendimethalin','stomp_aqua_pendimethalin', 'Reserpine', 'Thiram', 'Propiconazole','Cyproterone acetate', 'Bifenthrin', 'Trifloxystrobin', 'PFOA', 'Cycloheximide','Simazine', 'Cyproconazole', 'Simvastatin', 'Pyraclostrobin', 'PFOS', 'Triiodothyronine', 'Vinclozolin', '4-Hydroxytamoxifen', 'Maneb','Tetrac', 'Ziram','4-Cumylphenol', 'Lovastatin', 'Cyanazine', 'Fulvestrant', 'Nilutamide','Cypermethrin', 'Prochloraz', 'gesaprim', 'Imazalil', 'Rotenone','Dexamethasone', 'ZEA','TGSA', '4-(4-propan-2-yloxyphenyl)sulfonylphenol', 'BADGE')
+
+chemicals_accepted <- unique(c(nemesis, eu, zenodo, "DMSO"))
+
+
+dim(meta_data)
+
+excluded_chemicals <- c("Genistein", "Trichostatin A", "rapamycin")
+meta_data <- meta_data[
+  meta_data$exposure != "" &
+  !is.na(meta_data$exposure) &
+  (meta_data$exposure %in% chemicals_accepted) &
+  !(meta_data$exposure %in% excluded_chemicals),
+]
+
+dim(meta_data)
+
+samples_to_keep <- meta_data$description
+raw_matrix <- raw_matrix[, c("Gene", samples_to_keep)]
+dim(raw_matrix)
+```
+
+Modify the meta_data so that they have all the information in the right manner
+```{r}
+meta_data <- meta_data %>%
+  mutate(media2 = if_else(grepl("HI", media), "HI", "CS")) %>%
+  mutate(exposure_media = paste(exposure_time, media2, sep = "_"))
+```
+
+I have to divide the dataset by time points otherwise is too big to be analyzed. 
+```{r}
+exposure_media <- c("6h_CS", "12h_HI", "24h_HI", "12h_CS", "24h_CS")
+```
+
+```{r}
+# divide the metadata
+meta_data_list <- split(meta_data, meta_data$exposure_media)
+
+# divide the raw_matrix
+raw_matrix_list <- lapply(meta_data_list, function(df) {
+  samples <- df$description
+  raw_matrix[, c("Gene", samples)]
+})
+
+```
+
+Save the metadata divided by time
+```{r}
+for (time in exposure_media) {
+  output_dir <- paste0("/project/hbp694/",GSE,"/results/",time,"/")
+  if (!dir.exists(output_dir)) {
+      dir.create(output_dir, recursive = TRUE)
+    }
+  file_name <- paste0(output_dir, "meta_data_", time, ".xlsx")
+  write.xlsx(meta_data_list[[time]], file = file_name, rowNames = FALSE)
+}
+```
+
+
+```{r}
+#for (time in names(meta_data_list)) --> could be also an option 
+for (time in exposure_media) {
+  cat("\n==== Processing:", time, "====\n")
+  
+  sub_meta <- meta_data_list[[time]]
+  sub_matrix <- raw_matrix_list[[time]]
+  
+  # group by the Gene column and calculate the median for all other columns using summarise_all
+  merged_data <- sub_matrix %>%
+    group_by(Gene) %>%
+    summarise(across(everything(), ~ median(as.numeric(.), na.rm = TRUE)))
+  
+  # convert into a data frame and remove the Gene column putting it in the rowsnames
+  merged_data <- as.data.frame(merged_data)
+  rownames(merged_data) <- merged_data$Gene
+  merged_data$Gene <- NULL
+  
+  raw_matrix_final <- merged_data
+  
+  #Check if the raw data matrix column names and metadata GSM:s match
+  if (identical(as.character(colnames(raw_matrix_final)), as.character(sub_meta$description))) {
+    
+    #Move all the names to the geo_accession
+    sample_to_geo <- setNames(sub_meta$geo_accession, as.character(sub_meta$description))
+    # Update column names in raw_matrix_ordered based on this mapping
+    colnames(raw_matrix_final) <- sample_to_geo[colnames(raw_matrix_final)]
+    
+    #Check if the raw data matrix column names and metadata GSM:s match
+    if (identical(as.character(colnames(raw_matrix_final)), as.character(sub_meta$geo_accession))) {
+      #Save the result in a new file
+      write.table(raw_matrix_final, file = paste0("/project/hbp694/",GSE,"/results/",time,"/raw_matrix_ordered_",time,".tsv"), sep = "\t", col.names =TRUE)
+      
+    } else {
+      print("No match after the rename")
+    }
+  } else {
+    print("No match")
+  }
+}
+
+```
+
+
+
+### Filter the low counts - Function
+
+```{r}
+######################### Filter the low counts - Function #############################################
+filter_low_counts <- function(counts.matrix, conditions, method = "cpm", normalized=FALSE, depth=NULL, cpm=1, p.adj = "fdr"){
+  
+  if(is.null(counts.matrix)){stop("Error: please provide a numeric count matrix!")}
+  if(is.null(conditions)){stop("Error: please provide a factor or a vector indicating the conditions!")}
+  if(!method %in% c("cpm", "wilcoxon", "proportion")) {stop("Error: Please type in one of valid methods!")}
+  
+  
+  if (method=="cpm"){
+    filtered.counts = NOISeq::filtered.data(counts.matrix, factor = conditions, norm = normalized, method = 1, cv.cutoff = 100, cpm = cpm, p.adj = p.adj)
+    
+  }else if(method=="wilcoxon"){
+    filtered.counts = NOISeq::filtered.data(counts.matrix, factor = conditions, norm = normalized, method = 2, cv.cutoff = 100, p.adj = p.adj)
+    
+  }else if(method=="proportion"){
+    
+    if(is.null(depth)){stop("Error: indicate a numeric vector indicating per sample library depths")}
+    if(!class(depth)=="numeric"){stop("Error: please provide the depth argument with a numeric vector!")}
+    ### Compute librarary depth
+    
+    
+    filtered.counts = NOISeq::filtered.data(counts.matrix, factor = conditions, norm = normalized, depth = depth, method = 3, cv.cutoff = 100, cpm = cpm, p.adj = p.adj)
+  }
+  return(filtered.counts)
+}
+
+###(Proportion test) performs a proportion test on the counts per condition and feature
+#(or pseudo-counts if data were normalized) where null hypothesis is that the feature relative expression 
+#(count proportion) is equal to cpm/10^6 and higher than cpm/10^6 for the alternative.
+#Those features with p-value greater than 0.05 in all the conditions are removed
+
+##########################################################################################################
+```
+
+
+
+The DEG variable is composed by the chemical (without special characters), the dose amount (no dose unit because are all equal) and the media used. 
+```{r}
+for (time in exposure_media) {
+  cat("\n==== Processing:", time, "====\n")
+  
+  #Load the new files
+  raw_matrix_ordered <- read.table(paste0("/project/hbp694/",GSE,"/results/",time,"/raw_matrix_ordered_",time,".tsv"), 
+                                   sep = "\t", 
+                                   header = TRUE, 
+                                   stringsAsFactors = FALSE)
+  
+  meta_data <- read.xlsx(paste0("/project/hbp694/",GSE,"/results/",time,"/meta_data_", time, ".xlsx"), sheet = 1)
+  
+  #Check the dimensions
+  print(dim(raw_matrix_ordered))
+  print(dim(meta_data))
+  
+  #Create the DEG variable
+  meta_data$DEG_variables <- paste(
+    gsub("[:_\\-\\s\u00A0]+", ".", meta_data$exposure, perl = TRUE),
+    meta_data$`dose(amount)`,
+    sep = "_"
+  )
+  conditions<-(meta_data$DEG_variables)
+  print(table(conditions))
+  
+  #Save the file with the DEG_conditions column
+  write.xlsx(meta_data, file = paste0( "/project/hbp694/",GSE,"/results/",time,"/updated_",time,"_DEG_conditions.xlsx"), sheetName = "Sheet1", rowNames = FALSE)
+  
+  filtered_data <- filter_low_counts(counts.matrix = raw_matrix_ordered, conditions = conditions, method = "proportion", normalized = FALSE, p.adj = "fdr", depth = as.numeric(apply(raw_matrix_ordered, 2, sum)))
+  
+  as.numeric(apply(filtered_data, 2, sum))
+  
+  write.table(filtered_data, file = paste0( "/project/hbp694/",GSE,"/results/",time,"/filtered_raw_expression_matrix_",time,".tsv"), sep = "\t", col.names =TRUE)
+
+}
+
+```
+
+Make confounding plots
+```{r message = FALSE, warning = FALSE}
+library(swamp)
+
+for (time in exposure_media) {
+  cat("\n==== Processing:", time, "====\n")
+  
+  # load the necessary data
+  filtered_data <- read.table(paste0( "/project/hbp694/",GSE,"/results/",time,"/filtered_raw_expression_matrix_",time,".tsv"), 
+                               sep = "\t", 
+                               header = TRUE, 
+                               stringsAsFactors = FALSE)
+  
+  meta_data <- read.xlsx(paste0( "/project/hbp694/",GSE,"/results/",time,"/updated_",time,"_DEG_conditions.xlsx"), sheet = 1)
+  
+  conditions<-(meta_data$DEG_variables)
+  filtered_data_as_integer<-sapply(filtered_data,as.integer)
+  
+  rownames(filtered_data_as_integer) <- rownames(filtered_data)
+  
+  ###########################
+  
+  colData <- data.frame(condition=as.factor(conditions),sample=as.factor(meta_data$geo_accession), plate = as.factor(meta_data$assay_plate))
+  rownames(colData) <- colnames(filtered_data_as_integer)
+
+  #ddsMat <- DESeq2::DESeqDataSetFromMatrix(countData = filtered_data_as_integer, colData = colData, design = ~plate+condition)
+
+
+  # colData <- data.frame(condition=as.vector(conditions),sample=as.vector(meta_data$geo_accession))
+  # rownames(colData) <- colnames(filtered_data_as_integer)
+  # 
+  # ddsMat <- DESeq2::DESeqDataSetFromMatrix(countData = filtered_data_as_integer, colData = colData, design = ~condition)
+  
+  cat("Generating confounding plot for:", time, "\n")
+  
+  # Convert character columns to factors
+  colData[] <- lapply(colData, function(x) if (is.character(x)) as.factor(x) else x)
+  
+  # Filter out constant variables
+  non_constant_vars <- sapply(colData, function(col) length(unique(col)) > 1)
+  
+  constant_vars <- names(non_constant_vars)[!non_constant_vars]
+
+  # Log or print constant columns
+  if (length(constant_vars) > 0) {
+    cat("Removed constant metadata columns for", time, ":", paste(constant_vars, collapse = ", "), "\n")
+  } else {
+    cat("No constant metadata columns removed for", time, "\n")
+  }
+    
+  pd_mod_filtered <- colData[, non_constant_vars]
+  
+  # Create output folder if needed
+  output_dir <- file.path("/project/hbp694/", GSE, "/results/", time, "/")
+  
+  # Plot to PDF
+  pdf(file.path(output_dir, paste0("confounding_plot_", time, ".pdf")), width = 8, height = 8)
+  confounding_results <- swamp::confounding(pd_mod_filtered, margins = c(10, 10))
+  dev.off()
+  
+}
+
+```
+
+# Decide if do all the chemicals together or not 
+
+## Not divided by chemicals 
+```{r message = FALSE, warning = FALSE}
+for (time in exposure_media) {
+  cat("\n==== Processing:", time, "====\n")
+  
+  # load the necessary data
+  filtered_data <- read.table(paste0("/project/hbp694/",GSE,"/results/",time,"/filtered_raw_expression_matrix_",time,".tsv"), sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+  
+  meta_data <- read.xlsx(paste0( "/project/hbp694/",GSE,"/results/",time,"/updated_",time,"_DEG_conditions.xlsx"), sheet = 1)
+  
+  conditions<-(meta_data$DEG_variables)
+  filtered_data_as_integer<-sapply(filtered_data,as.integer)
+  
+  rownames(filtered_data_as_integer) <- rownames(filtered_data)
+  
+
+  # Define output directory
+  output_dir <- paste0("/project/hbp694/",GSE,"/results/",time,"/not_divided/")
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+  }
+  
+  # analysis
+  colData2 <- data.frame(condition=as.factor(conditions),sample=as.factor(meta_data$sample), plate = as.factor(meta_data$assay_plate))
+  rownames(colData2) <- colnames(filtered_data_as_integer)
+
+  ddsMat <- DESeq2::DESeqDataSetFromMatrix(countData = filtered_data_as_integer,
+                                         colData = colData2,
+                                         design = ~plate+condition) 
+
+
+
+  # colData <- data.frame(condition=as.vector(conditions),sample=as.vector(meta_data$geo_accession))
+  # rownames(colData) <- colnames(filtered_data_as_integer)
+  # 
+  # ddsMat <- DESeq2::DESeqDataSetFromMatrix(countData = filtered_data_as_integer, colData = colData, design = ~condition)
+
+  
+  vsd <- vst(ddsMat, blind = FALSE)
+  
+  vsd_counts <- assay(vsd)
+  write.table(vsd_counts,  file = paste0(output_dir,"/vst_expression_matrix_",time,"_Blind_F.tsv"), quote = FALSE, sep = "\t", row.names = TRUE, col=NA)
+  
+  saveRDS(vsd,file=paste0(output_dir,"/vsd.rds"))
+  
+  
+  # rld <- rlog(ddsMat, blind = FALSE)
+  # write.table(rld, file = paste0(output_dir,"/rld_expression_matrix_",time,".tsv"), quote = FALSE, sep = "\t", row.names = TRUE, col=NA)
+  # ntd <- normTransform(ddsMat)
+  # write.table(ntd, file = paste0(output_dir,"/ntd_expression_matrix_",time,".tsv"), quote = FALSE, sep = "\t", row.names = TRUE, col=NA)
+    
+}
+
+```
+
+
+## Divided by chemicals
+```{r message=FALSE, warning=FALSE}
+for (time in exposure_media) {
+  cat("\n==== Processing:", time, "====\n")
+  
+  # load the necessary data
+  filtered_data <- read.table(paste0( "/project/hbp694/",GSE,"/results/",time,"/filtered_raw_expression_matrix_",time,".tsv"), 
+                               sep = "\t", 
+                               header = TRUE, 
+                               stringsAsFactors = FALSE)
+  
+  meta_data <- read.xlsx(paste0( "/project/hbp694/",GSE,"/results/",time,"/updated_",time,"_DEG_conditions.xlsx"), sheet = 1)
+  
+  
+  ###########################
+  
+  # Division by chemical
+  
+  chemicals <- unique(unique(meta_data$exposure))
+  chemicals <- chemicals[chemicals != "DMSO"]
+  
+  control_samples <- meta_data[grepl("DMSO", meta_data$exposure), ]
+  
+  # iterate on the chemicals and execute the instructions
+  for (chem in chemicals) {
+    
+    cat("\n==== Processing:", chem, "====\n")
+
+    # Define output directory
+    output_dir <- paste0("/project/hbp694/",GSE,"/results/",time, "/", chem,"/")
+    if (!dir.exists(output_dir)) {
+      dir.create(output_dir, recursive = TRUE)
+    }
+
+    
+    # select the samples for that chemical
+    condition_samples <- meta_data[meta_data$exposure == chem, ]
+    
+    # subset the data
+    meta <- rbind(condition_samples, control_samples)
+    data <- filtered_data[, meta$geo_accession, drop = FALSE]
+    
+    conditions<-(meta$DEG_variables)
+    data<-sapply(data,as.integer)
+    rownames(data) <- rownames(data)
+    
+    # analysis
+    colData2 <- data.frame(condition=as.factor(conditions),sample=as.factor(meta$sample), plate = as.factor(meta$assay_plate))
+    rownames(colData2) <- colnames(data)
+  
+    ddsMat <- DESeq2::DESeqDataSetFromMatrix(countData = data,
+                                           colData = colData2,
+                                           design = ~plate+condition) 
+
+  
+    # colData <- data.frame(condition=as.vector(conditions),sample=as.vector(meta_data$geo_accession))
+    # rownames(colData) <- colnames(filtered_data_as_integer)
+    # 
+    # ddsMat <- DESeq2::DESeqDataSetFromMatrix(countData = filtered_data_as_integer, colData = colData, design = ~condition)
+  
+    
+    vsd <- vst(ddsMat, blind = FALSE)
+    
+    vsd_counts <- assay(vsd)
+    write.table(vsd_counts,  file = paste0(output_dir,"/vst_expression_matrix_",time,"_Blind_F.tsv"), quote = FALSE, sep = "\t", row.names = TRUE, col=NA)
+    
+    saveRDS(vsd,file=paste0(output_dir,"/vsd.rds"))
+    
+    
+    # rld <- rlog(ddsMat, blind = FALSE)
+    # write.table(rld, file = paste0(output_dir,"/rld_expression_matrix_",time,".tsv"), quote = FALSE, sep = "\t", row.names = TRUE, col=NA)
+    # ntd <- normTransform(ddsMat)
+    # write.table(ntd, file = paste0(output_dir,"/ntd_expression_matrix_",time,".tsv"), quote = FALSE, sep = "\t", row.names = TRUE, col=NA)
+    
+  }
+}
+
+```
+
+Colored by sample
+```{r}
+for (time in exposure_media) {
+  output_dir <- paste0("/project/hbp694/",GSE,"/results/",time,"/not_divided/")
+  
+  meta_data <- read.xlsx(paste0( "/project/hbp694/",GSE,"/results/",time,"/updated_",time,"_DEG_conditions.xlsx"), sheet = 1)
+
+  # Read the table with appropriate settings
+  vst <- read.table(paste0(output_dir,"/vst_expression_matrix_",time,"_Blind_F.tsv"), header = TRUE, sep = "\t", row.names = 1, check.names = FALSE)
+  
+  # Calculate the variance-stabilized counts on the top 500 most variable genes
+  row_variances <- apply(vst, 1, var)
+  top_genes <- order(row_variances, decreasing = TRUE)[1:500]
+  vst_top <- vst[top_genes, ]
+  
+  # Perform PCA
+  pca <- prcomp(t(vst_top), scale. = TRUE)
+  
+  # Extract sample names and any grouping variable from meta data
+  pca_data <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], sample = meta_data$geo_accession)  
+  
+  # Plot with ggplot2
+  # Plot with ggplot2, without labels
+  # Plot with ggplot2, without legend
+  p <- ggplot(pca_data, aes(x = PC1, y = PC2, color = sample)) +
+    geom_point(size = 3) +
+    labs(title = paste("PCA Plot",time), x = "PC1", y = "PC2") +
+    theme_minimal() +
+    theme(legend.position = "none")
+  
+  print(p)
+}
+```
+
+```{r}
+for (time in exposure_media) {
+  meta_data <- read.xlsx(paste0( "/project/hbp694/",GSE,"/results/",time,"/updated_",time,"_DEG_conditions.xlsx"), sheet = 1)
+  
+  output_dir <- paste0("/project/hbp694/",GSE,"/results/",time,"/not_divided/")
+  
+  # Read the table with appropriate settings
+  vst <- read.table(paste0(output_dir,"/vst_expression_matrix_",time,"_Blind_F.tsv"), header = TRUE, sep = "\t", row.names = 1, check.names = FALSE)
+  
+  # Calculate the variance-stabilized counts on the top 500 most variable genes
+  row_variances <- apply(vst, 1, var)
+  top_genes <- order(row_variances, decreasing = TRUE)[1:500]
+  vst_top <- vst[top_genes, ]
+  
+  # Perform PCA
+  pca <- prcomp(t(vst_top), scale. = TRUE)
+  
+  # Extract sample names and any grouping variable from meta data
+  pca_data <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], sample = meta_data$geo_accession)
+  
+  # Plot with ggplot2, without legend but with labels over each dot
+  p <- ggplot(pca_data, aes(x = PC1, y = PC2, color = sample)) +
+    geom_point(size = 3) +
+    geom_text(aes(label = sample), vjust = -1, size = 3) +  # Add labels above each dot
+    labs(title = paste("PCA Plot",time), x = "PC1", y = "PC2") +
+    theme_minimal() +
+    theme(legend.position = "none")
+  
+  print(p)
+}
+```
+
+
+Colored by condition
+
+```{r}
+for (time in exposure_media) {
+  meta_data <- read.xlsx(paste0( "/project/hbp694/",GSE,"/results/",time,"/updated_",time,"_DEG_conditions.xlsx"), sheet = 1)
+  
+  output_dir <- paste0("/project/hbp694/",GSE,"/results/",time,"/not_divided/")
+  
+  # Read the table with appropriate settings
+  vst <- read.table(paste0(output_dir,"/vst_expression_matrix_",time,"_Blind_F.tsv"), header = TRUE, sep = "\t", row.names = 1, check.names = FALSE)
+  
+  # Calculate the variance-stabilized counts on the top 500 most variable genes
+  row_variances <- apply(vst, 1, var)
+  top_genes <- order(row_variances, decreasing = TRUE)[1:500]
+  vst_top <- vst[top_genes, ]
+  
+  # Perform PCA
+  pca <- prcomp(t(vst_top), scale. = TRUE)
+
+  pca_data <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], condition = meta_data$DEG_variables)  # Adjust 'sample' as needed
+  
+  # Plot with ggplot2
+  # Plot with ggplot2, without labels
+  # Plot with ggplot2, without legend
+  p <- ggplot(pca_data, aes(x = PC1, y = PC2, color = condition)) +
+    geom_point(size = 3) +
+    labs(title = paste("PCA Plot",time), x = "PC1", y = "PC2") +
+    theme_minimal() +
+    theme(legend.position = "none")
+  
+  print(p)
+  
+}
+```
+
+```{r}
+for (time in exposure_media) {
+  meta_data <- read.xlsx(paste0( "/project/hbp694/",GSE,"/results/",time,"/updated_",time,"_DEG_conditions.xlsx"), sheet = 1)
+  
+  output_dir <- paste0("/project/hbp694/",GSE,"/results/",time,"/not_divided/")
+  
+  # Read the table with appropriate settings
+  vst <- read.table(paste0(output_dir,"/vst_expression_matrix_",time,"_Blind_F.tsv"), header = TRUE, sep = "\t", row.names = 1, check.names = FALSE)
+  
+  # Calculate the variance-stabilized counts on the top 500 most variable genes
+  row_variances <- apply(vst, 1, var)
+  top_genes <- order(row_variances, decreasing = TRUE)[1:500]
+  vst_top <- vst[top_genes, ]
+  
+  # Perform PCA
+  pca <- prcomp(t(vst_top), scale. = TRUE)
+
+  pca_data <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], condition = meta_data$DEG_variables)  # Adjust 'sample' as needed
+  
+  # Plot with ggplot2, without legend but with labels over each dot
+  p <- ggplot(pca_data, aes(x = PC1, y = PC2, color = condition)) +
+    geom_point(size = 3) +
+    geom_text(aes(label = condition), vjust = -1, size = 3) +  # Add labels above each dot
+    labs(title = paste("PCA Plot",time), x = "PC1", y = "PC2") +
+    theme_minimal() +
+    theme(legend.position = "none")
+  
+  print(p)
+  
+}
+
+```
+In general there are no outliers clearly visible from the PCA, so I'll maintain all the samples for the moment.
+
+
+Check the reads counts. At the moment I'll visualize the first 160 samples and take as cut off 300000. 
+```{r}
+for (time in exposure_media) {
+  cat("\n==== Processing:", time, "====\n")
+  
+  meta_data <- read.xlsx(paste0("/project/hbp694/",GSE,"/results/",time,"/updated_",time,"_DEG_conditions.xlsx"), sheet = 1)
+  
+  output_dir <- paste0("/project/hbp694/",GSE,"/results/",time,"/not_divided/")
+  
+  # load the necessary data
+  filtered_data <- read.table(paste0("/project/hbp694/",GSE,"/results/",time,"/filtered_raw_expression_matrix_",time,".tsv"), sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+  
+  column_sums <- apply(filtered_data, 2, sum)
+  names(column_sums) <- colnames(filtered_data)  # Assign column names to the sums
+  
+  # Sort the sums in ascending order and select the lowest 100
+  lowest_160_sums <- sort(column_sums)[1:160]
+  
+  # Convert to a data frame for easy viewing
+  lowest_160_df <- data.frame(Sample = names(lowest_160_sums), Sum = lowest_160_sums)
+  
+  # View the lowest 100 column names and their sums
+  print(lowest_160_df)
+  
+  #take the samples with less than 300000 reads
+  low_sum_columns <- names(column_sums[column_sums < 300000])
+
+  # Save the result as a list
+  low_sum_list <- c(low_sum_columns)
+  
+  # Display the list
+  print(low_sum_list)
+}
+```
+
+
+
+### If there are outliers you have to repeat all the procedure without the outliers.
+
+I will remove only what is below 300000 reads since no outliers were found from the PCA
+
+```{r}
+for (time in exposure_media) {
+  
+  cat("\n==== Processing:", time, "====\n")
+  
+  output_dir <- paste0("/project/hbp694/",GSE,"/results/",time,"/not_divided/")
+  
+  # load the necessary data
+  raw_matrix_ordered <- read.table(paste0("/project/hbp694/",GSE,"/results/",time,"/raw_matrix_ordered_",time,".tsv"), sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+  
+  meta_data <- read.xlsx(paste0( "/project/hbp694/",GSE,"/results/",time,"/updated_",time,"_DEG_conditions.xlsx"), sheet = 1)
+
+  filtered_data <- read.table(paste0("/project/hbp694/",GSE,"/results/",time,"/filtered_raw_expression_matrix_",time,".tsv"), sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+
+  column_sums <- apply(filtered_data, 2, sum)
+  names(column_sums) <- colnames(filtered_data)  # Assign column names to the sums
+  
+  low_sum_columns <- names(column_sums[column_sums < 300000])
+  
+  # Save the result as a list
+  outliers <- c(low_sum_columns)
+
+  # Filter out the rows in meta_data that match the labeled GSM values
+  meta_data_no_outlier <- meta_data[!meta_data$geo_accession %in% outliers, ]
+  
+  # Filter out the columns in raw_matrix_ordered that match any of the labeled GSM values
+  raw_matrix_no_outlier <- raw_matrix_ordered[, !grepl(paste(outliers, collapse = "|"), colnames(raw_matrix_ordered))]
+  
+  flag <- identical(as.character(colnames(raw_matrix_no_outlier)), as.character(meta_data_no_outlier$geo_accession)) 
+  print(flag)
+  
+  # print(data.frame(colnames(raw_matrix_no_outlier), meta_data_no_outlier$geo_accession))
+  # print(match(colnames(raw_matrix_no_outlier), meta_data_no_outlier$geo_accession))
+  
+  #Let's change the order of the raw data to correspond the metadata. This way the saved data matrices downstream are in the same order as the metadata
+  matched_order <- match(meta_data_no_outlier$geo_accession, colnames(raw_matrix_no_outlier))
+  
+  #Reorder the columns of raw_matrix based on matched_order
+  raw_matrix_ordered <- raw_matrix_no_outlier[, matched_order]
+  
+  #Check if the reordering was successful
+  print(identical(as.character(colnames(raw_matrix_ordered)), as.character(meta_data_no_outlier$geo_accession)))
+  
+  #extract the conditions and print them
+  conditions<-(meta_data_no_outlier$DEG_variables)
+  #print(table(conditions))
+  
+  raw_matrix_ordered <- data.matrix(raw_matrix_ordered)
+  
+  filtered_data_no_outlier <- filter_low_counts(counts.matrix =raw_matrix_ordered, conditions = conditions, method = "proportion", normalized = FALSE, p.adj = "fdr", depth = as.numeric(apply(raw_matrix_ordered, 2, sum)))
+
+  write.table(filtered_data_no_outlier, file = paste0(output_dir,"/filtered_raw_expression_matrix_",time,"_no_outlier.tsv"), sep = "\t", col.names =TRUE)
+  write.table(meta_data_no_outlier, file = paste0(output_dir,"/meta_data_",time,"_no_outlier.tsv"), sep = "\t", col.names = TRUE)
+
+}
+```
+
+
+Compare different transformation methods for PCA
+```{r message = FALSE, warning = FALSE}
+
+for (time in exposure_media) {
+  
+  cat("\n==== Processing:", time, "====\n")
+  
+  output_dir <- paste0("/project/hbp694/",GSE,"/results/",time, "/not_divided/")
+  
+  #load necessary data
+  filtered_data_no_outlier <- read.table(paste0(output_dir,"/filtered_raw_expression_matrix_",time,"_no_outlier.tsv"), sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+  
+  meta_data_no_outlier <- read.table(file = paste0(output_dir,"/meta_data_",time,"_no_outlier.tsv"), sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+  
+  conditions<-(meta_data_no_outlier$DEG_variables)
+  filtered_data_as_integer<-sapply(filtered_data_no_outlier,as.integer)
+  rownames(filtered_data_as_integer)<-rownames(filtered_data_no_outlier)
+  
+  cat("Data Uploaded")
+  ###########################
+  
+  colData <- data.frame(condition=as.vector(conditions),sample=as.vector(meta_data_no_outlier$sample), plate=as.factor(meta_data_no_outlier$assay_plate))
+  rownames(colData) <- colnames(filtered_data_as_integer)
+  
+  ddsMat <- DESeq2::DESeqDataSetFromMatrix(countData = filtered_data_as_integer, colData = colData, design = ~plate+condition)
+  
+  cat("Data ready!\nStarting VST")
+  
+  vsd <- vst(ddsMat, blind = FALSE)
+  
+  vsd_counts <- assay(vsd)
+  
+  cat("Saving files")
+  write.table(vsd_counts,  file = paste0(output_dir,"/vst_expression_matrix_",time,"_Blind_F_no_outlier.tsv"), quote = FALSE, sep = "\t", row.names = TRUE, col=NA)
+  
+  saveRDS(vsd,file=paste0(output_dir,"/vsd_no_outlier.rds"))
+}
+```
+
+Check the heteroscedasticity of the data
+```{r}
+for (time in exposure_media) {
+  
+  cat("\n==== Processing:", time, "====\n")
+  output_dir <- paste0("/project/hbp694/",GSE,"/results/",time, "/not_divided/")
+  
+  #RAW COUNTS
+  raw_counts <- read.delim(paste0(output_dir,"/filtered_raw_expression_matrix_",time,"_no_outlier.tsv"), row.names = 1)
+  res <- meanSdPlot(as.matrix(raw_counts))
+  plot <- res$gg +
+    scale_y_continuous(trans = "log2") +
+    ggtitle(paste0("Sd logscale",time))
+  ggsave(paste0(output_dir,"/variance_not_normalized_data.png"), plot = plot, width = 6, height = 4)
+  print(plot)
+  
+  #VST
+  vst_matrix <- read.delim(paste0(output_dir,"/vst_expression_matrix_",time,"_Blind_F_no_outlier.tsv"), row.names = 1)
+  res <- meanSdPlot(as.matrix(vst_matrix))
+  plot <- res$gg +
+    ggtitle(paste0("VST transformed data",time))
+  ggsave(paste0(output_dir,"/variance_vst_transformed_data.png"), plot = plot, width = 6, height = 4)
+  print(plot)
+}
+```
+
+
+Colored by sample
+```{r}
+for (time in exposure_media) {
+  
+  cat("\n==== Processing:", time, "====\n")
+  output_dir <- paste0("/project/hbp694/",GSE,"/results/",time, "/not_divided/")
+  
+  # Read the table with appropriate settings
+  vst <- read.table(paste0(output_dir,"/vst_expression_matrix_",time,"_Blind_F_no_outlier.tsv"), header = TRUE, sep = "\t", row.names = 1, check.names = FALSE)
+  
+  meta_data_no_outlier <- read.table(file = paste0(output_dir,"/meta_data_",time,"_no_outlier.tsv"), sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+  
+  # Calculate the variance-stabilized counts on the top 500 most variable genes
+  row_variances <- apply(vst, 1, var)
+  top_genes <- order(row_variances, decreasing = TRUE)[1:500]
+  vst_top <- vst[top_genes, ]
+  
+  # Perform PCA
+  pca <- prcomp(t(vst_top), scale. = TRUE)
+  
+  # Extract sample names and any grouping variable from meta data
+  pca_data <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], sample = meta_data_no_outlier$geo_accession)  # Adjust 'sample' as needed
+  
+  # Plot with ggplot2
+  # Plot with ggplot2, without labels
+  # Plot with ggplot2, without legend
+  p <- ggplot(pca_data, aes(x = PC1, y = PC2, color = sample)) +
+    geom_point(size = 3) +
+    labs(title = paste("PCA Plot",time), x = "PC1", y = "PC2") +
+    theme_minimal() +
+    theme(legend.position = "none")
+  
+  print(p)
+}
+```
+
+
+```{r}
+for (time in exposure_media) {
+  
+  cat("\n==== Processing:", time, "====\n")
+  output_dir <- paste0("/project/hbp694/",GSE,"/results/",time, "/not_divided/")
+  
+  # Read the table with appropriate settings
+  vst <- read.table(paste0(output_dir,"/vst_expression_matrix_",time,"_Blind_F_no_outlier.tsv"), header = TRUE, sep = "\t", row.names = 1, check.names = FALSE)
+  
+  meta_data_no_outlier <- read.table(file = paste0(output_dir,"/meta_data_",time,"_no_outlier.tsv"), sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+  
+  # Calculate the variance-stabilized counts on the top 5000 most variable genes
+  row_variances <- apply(vst, 1, var)
+  top_genes <- order(row_variances, decreasing = TRUE)[1:500]
+  vst_top <- vst[top_genes, ]
+  
+  # Perform PCA
+  pca <- prcomp(t(vst_top), scale. = TRUE)
+  
+  # Extract sample names and any grouping variable from meta data
+  pca_data <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], condition = meta_data_no_outlier$DEG_variables)  # Adjust 'sample' as needed
+  
+  # Plot with ggplot2
+  # Plot with ggplot2, without labels
+  # Plot with ggplot2, without legend
+  p <- ggplot(pca_data, aes(x = PC1, y = PC2, color = condition)) +
+    geom_point(size = 3) +
+    labs(title = paste("PCA Plot",time), x = "PC1", y = "PC2") +
+    theme_minimal() +
+    theme(legend.position = "none")
+  
+  print(p)
+}
+
+```
+
+Colored by condition
+```{r}
+for (time in exposure_media) {
+  
+  cat("\n==== Processing:", time, "====\n")
+  output_dir <- paste0("/project/hbp694/",GSE,"/results/",time, "/not_divided/")
+  
+  # Read the table with appropriate settings
+  vst <- read.table(paste0(output_dir,"/vst_expression_matrix_",time,"_Blind_F_no_outlier.tsv"), header = TRUE, sep = "\t", row.names = 1, check.names = FALSE)
+  
+  meta_data_no_outlier <- read.table(file = paste0(output_dir,"/meta_data_",time,"_no_outlier.tsv"), sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+  
+  # Calculate the variance-stabilized counts on the top 5000 most variable genes
+  row_variances <- apply(vst, 1, var)
+  top_genes <- order(row_variances, decreasing = TRUE)[1:500]
+  vst_top <- vst[top_genes, ]
+  
+  # Perform PCA
+  pca <- prcomp(t(vst_top), scale. = TRUE)
+  
+  # Extract sample names and any grouping variable from meta data
+  pca_data <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], condition = meta_data_no_outlier$DEG_variables)  # Adjust 'sample' as needed
+  
+  p <- ggplot(pca_data, aes(x = PC1, y = PC2, color = condition)) +
+  geom_point(size = 3) +
+  geom_text(aes(label = condition), vjust = -1, size = 3) +  # Add labels above each dot
+  labs(title = paste("PCA Plot",time), x = "PC1", y = "PC2") +
+  theme_minimal() +
+  theme(legend.position = "none")
+  
+  print(p)
+}
+
+```
+
+## DEGs not divided by chemicals --> not working in R studio
+```{r}
+###############################################################
+
+### Differential expression analysis ###
+
+###############################################################
+for (time in exposure_media) {
+  
+  cat("\n==== Processing:", time, "====\n")
+  output_dir <- paste0("/project/hbp694/",GSE,"/results/",time, "/not_divided/")
+
+  #load necessary data
+  filtered_data_no_outlier <- read.table(paste0(output_dir,"/filtered_raw_expression_matrix_",time,"_no_outlier.tsv"), sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+  meta <- read.table(file = paste0(output_dir,"/meta_data_",time,"_no_outlier.tsv"), sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+  
+  data<-sapply(filtered_data_no_outlier,as.integer)
+  rownames(data)<-rownames(filtered_data_no_outlier)
+  
+  conditions<-(meta$DEG_variables)
+  cat("Data Uploaded")
+  
+  # analysis
+  colData <- data.frame(condition=as.factor(conditions),sample=as.vector(meta$sample), plate=as.factor(meta$assay_plate))
+  colData$condition <- droplevels(colData$condition)
+  rownames(colData) <- colnames(data)
+  
+  ddsMat <- DESeq2::DESeqDataSetFromMatrix(countData = data,
+                                         colData = colData,
+                                         design = ~plate+condition) 
+  
+  cat("Data Ready!\nStarting DESeq")
+  
+  dds <- DESeq2::DESeq(ddsMat)
+  total_norm_counts <- DESeq2::counts(dds, normalized=TRUE)
+  
+  cat("Saving Outputs")
+  write.table(total_norm_counts, file = paste0(output_dir, "normalized_expression_matrix_",time,"_no_outlier.tsv"), quote = FALSE, sep = "\t", row.names = TRUE, col=NA)
+  saveRDS(dds,file=paste0(output_dir, "dds.rds"))
+  
+  condition_counts <- table(conditions)
+  valid_conditions <- names(condition_counts[condition_counts >= 3])
+  
+  cat("Conditions")
+  print(condition_counts)
+  
+  # Load the data 
+  #dds <- readRDS(file=paste0(output_dir, "dds.rds"))
+  #meta_data_no_outlier <- read.table(file = paste0(output_dir,"/meta_data_",time,"_no_outlier.tsv"), sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+  
+  cat("Starting DEGs analysis")
+  
+  # Filter unique conditions since all have to be compared with the same control group
+  deg_conditions <- meta %>%
+    filter(DEG_variables %in% valid_conditions) %>%
+    select(DEG_variables) %>%
+    distinct() %>%
+    filter(DEG_variables != paste0("DMSO_0"))
+  
+  # Loop through conditions
+  for (i in seq_len(nrow(deg_conditions))) {
+    condition <- deg_conditions$DEG_variables[i]
+    control <- paste0("DMSO_0")
+  
+    cat(sprintf("\n==== Processing: %s vs %s ====\n", condition, control))
+  
+    # Skip if either condition or control doesn't exist in the dds
+    if (!(condition %in% levels(colData(dds)$condition)) ||
+        !(control %in% levels(colData(dds)$condition))) {
+      warning(sprintf("Skipping %s vs %s: not found in DESeq2 condition levels", condition, control))
+      next
+    }
+  
+    # Define output file names
+    output_DEG <- paste0("/project/hbp694/",GSE,"/results/",time, "/not_divided/DEGs/")
+      if (!dir.exists(output_DEG)) {
+      dir.create(output_DEG, recursive = TRUE)
+    }
+    
+    unfiltered_file <- file.path(output_DEG, paste0("DEG_results_", condition, "_vs_", control, "_unfiltered.tsv"))
+    filtered_file   <- file.path(output_DEG, paste0("DEG_results_", condition, "_vs_", control, "_filtered.tsv"))
+  
+    # Run DESeq2 contrast
+    res <- results(dds, contrast = c("condition", condition, control),
+                   pAdjustMethod = "fdr", independentFiltering = FALSE)
+  
+    # Save unfiltered results
+    write.table(res, file = unfiltered_file, sep = "\t", row.names = TRUE, quote = FALSE)
+  
+    # Filter by FDR and log2FC
+    res_filtered <- res[which(res$padj <= 0.05 & abs(res$log2FoldChange) >= 0.58), ]
+  
+    cat(sprintf("Filtered DEGs: %d genes for %s vs %s\n", nrow(res_filtered), condition, control))
+  
+    # Save filtered results
+    write.table(res_filtered, file = filtered_file, sep = "\t", row.names = TRUE, quote = FALSE)
+  }
+}
+
+```
+
+
+
+
+## DEGs divided by chemicals 
+
+```{r}
+###############################################################
+
+### Differential expression analysis ###
+
+###############################################################
+
+for (time in exposure_media){
+  
+  cat("\n==== Processing:", time, "====\n")
+  #dir <- paste0("/project/hbp694/",GSE,"/results/",time, "/not_divided/")
+  dir <- paste0("C:/Users/Utente/Desktop/denys/results/",GSE,"/results/",time, "/not_divided/")
+  
+  #load necessary data
+  filtered_data_no_outlier <- read.table(paste0(dir,"/filtered_raw_expression_matrix_",time,"_no_outlier.tsv"), sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+  meta_data <- read.table(file = paste0(dir,"/meta_data_",time,"_no_outlier.tsv"), sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+  
+  # Division by chemical
+  chemicals <- unique(unique(meta_data$exposure))
+  chemicals <- chemicals[chemicals != "DMSO"]
+  
+  control_samples <- meta_data[grepl("DMSO", meta_data$exposure), ]
+  
+  for (chem in chemicals) {
+    
+    cat("\n==== Processing:", chem, "====\n")
+    #output_dir <- paste0("/project/hbp694/",GSE,"/results/",time, "/",chem,"/")
+    output_dir <- paste0("C:/Users/Utente/Desktop/denys/results/",GSE,"/results/",time, "/",chem,"/")
+    
+    # select the samples for that chemical
+    condition_samples <- meta_data[meta_data$exposure == chem, ]
+    
+    # subset the data
+    meta <- rbind(condition_samples, control_samples)
+    data <- filtered_data_no_outlier[, meta$geo_accession, drop = FALSE]
+    data<-sapply(data,as.integer)
+    rownames(data)<-rownames(filtered_data_no_outlier)
+    
+    conditions<-(meta$DEG_variables)
+    cat("Data Uploaded")
+    
+    # analysis
+    colData <- data.frame(condition=as.factor(conditions),sample=as.vector(meta$sample), plate=as.factor(meta$assay_plate))
+    colData$condition <- droplevels(colData$condition)
+    rownames(colData) <- colnames(data)
+    
+    ddsMat <- DESeq2::DESeqDataSetFromMatrix(countData = data,
+                                           colData = colData,
+                                           design = ~plate+condition) 
+    
+    cat("\nData Ready!\nStarting DESeq\n")
+    
+    dds <- DESeq2::DESeq(ddsMat)
+    total_norm_counts <- DESeq2::counts(dds, normalized=TRUE)
+    
+    cat("Saving Outputs")
+    write.table(total_norm_counts, file = paste0(output_dir, "normalized_expression_matrix_",time,"_no_outlier.tsv"), quote = FALSE, sep = "\t", row.names = TRUE, col=NA)
+    saveRDS(dds,file=paste0(output_dir, "dds.rds"))
+    
+    condition_counts <- table(conditions)
+    valid_conditions <- names(condition_counts[condition_counts >= 3])
+    
+    cat("Conditions")
+    print(condition_counts)
+    
+    # Load the data 
+    #dds <- readRDS(file=paste0(output_dir, "dds.rds"))
+    #meta_data_no_outlier <- read.table(file = paste0(output_dir,"/meta_data_",time,"_no_outlier.tsv"), sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+    
+    cat("\nStarting DEGs analysis\n")
+    
+    # Filter unique conditions since all have to be compared with the same control group
+    deg_conditions <- meta %>%
+      filter(DEG_variables %in% valid_conditions) %>%
+      select(DEG_variables) %>%
+      distinct() %>%
+      filter(DEG_variables != paste0("DMSO_0"))
+    
+    # Loop through conditions
+    for (i in seq_len(nrow(deg_conditions))) {
+      condition <- deg_conditions$DEG_variables[i]
+      control <- paste0("DMSO_0")
+    
+      cat(sprintf("\n==== Processing: %s vs %s ====\n", condition, control))
+    
+      # Skip if either condition or control doesn't exist in the dds
+      if (!(condition %in% levels(colData(dds)$condition)) ||
+          !(control %in% levels(colData(dds)$condition))) {
+        warning(sprintf("Skipping %s vs %s: not found in DESeq2 condition levels", condition, control))
+        next
+      }
+    
+      # Define output file names
+      #output_DEG <- paste0("/project/hbp694/",GSE,"/results/",time, "/",chem,"/DEGs/")
+      output_DEG <- paste0("C:/Users/Utente/Desktop/denys/results/",GSE,"/results/",time,"/",chem,"/DEGs/")
+        if (!dir.exists(output_DEG)) {
+        dir.create(output_DEG, recursive = TRUE)
+      }
+      
+      unfiltered_file <- file.path(output_DEG, paste0("DEG_results_", condition, "_vs_", control, "_unfiltered.tsv"))
+      filtered_file   <- file.path(output_DEG, paste0("DEG_results_", condition, "_vs_", control, "_filtered.tsv"))
+    
+      # Run DESeq2 contrast
+      res <- results(dds, contrast = c("condition", condition, control),
+                     pAdjustMethod = "fdr", independentFiltering = FALSE)
+    
+      # Save unfiltered results
+      write.table(res, file = unfiltered_file, sep = "\t", row.names = TRUE, quote = FALSE)
+    
+      # Filter by FDR and log2FC
+      res_filtered <- res[which(res$padj <= 0.05 & abs(res$log2FoldChange) >= 0.58), ]
+    
+      cat(sprintf("Filtered DEGs: %d genes for %s vs %s\n", nrow(res_filtered), condition, control))
+    
+      # Save filtered results
+      write.table(res_filtered, file = filtered_file, sep = "\t", row.names = TRUE, quote = FALSE)
+    }
+  }
+}
+
+```

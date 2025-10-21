@@ -1,0 +1,668 @@
+---
+title: "GSE211183_script"
+output: html_notebook
+---
+
+Read in the data
+```{r message = FALSE, warning = FALSE}
+library(readxl)
+library(dplyr)
+library(openxlsx)
+library("ggplot2")
+library("vsn")
+library("DESeq2")
+library(ggplot2)
+library(ggrepel)
+
+GSE <- "GSE211183"
+```
+
+```{r}
+meta_data <- read_excel("/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/GSE211183/updated_GSE211183.xlsx", sheet = 1)
+
+raw_matrix <- read.table("/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/GSE211183/GSE211183_count_table.csv", sep=",", stringsAsFactors=FALSE)
+
+```
+
+Modify the header of raw_matrix
+```{r}
+# modify the rownames: substitute everything that is after the _ with an empty string
+raw_matrix$V1 <- sub("_.*", "", raw_matrix$V1)
+
+# modify the colnames: use as colnmames the ones that were present in the raw table, not the one used when the table is uploaded
+colnames(raw_matrix)<- raw_matrix[1,]
+# remove the row with the names that was included in the table (and wasn't the header)
+raw_matrix <- raw_matrix[-1,]
+
+colnames(raw_matrix)[1] <- "Gene" 
+raw_matrix$Gene <- as.character(raw_matrix$Gene)
+```
+
+Put in the same order meta_data and raw_matrix looking at the column description of meta_data that contains the same names as the columns in raw_matrix
+```{r}
+ordered_samples <- meta_data$description
+raw_matrix <- raw_matrix[, c("Gene", ordered_samples)]
+```
+
+Prepare the metadata
+```{r}
+meta_data$sample <- meta_data$title
+```
+
+
+```{r}
+samples <- meta_data$description
+sub_matrix <- raw_matrix[, c("Gene", samples)]
+
+# group by the Gene column and calculate the median for all other columns using summarise_all
+merged_data <- sub_matrix %>%
+  group_by(Gene) %>%
+  summarise(across(everything(), ~ median(as.numeric(.), na.rm = TRUE)))
+
+# convert into a data frame and remove the Gene column putting it in the rowsnames
+merged_data <- as.data.frame(merged_data)
+rownames(merged_data) <- merged_data$Gene
+merged_data$Gene <- NULL
+
+raw_matrix <- merged_data
+```
+
+Check if the raw data matrix column names and metadata GSM:s match
+```{r}
+identical(as.character(colnames(raw_matrix)), as.character(meta_data$description))
+```
+Move all the names to the geo_accession
+```{r}
+sample_to_geo <- setNames(meta_data$geo_accession, as.character(meta_data$description))
+# Update column names in raw_matrix_ordered based on this mapping
+colnames(raw_matrix) <- sample_to_geo[colnames(raw_matrix)]
+```
+
+Check if the raw data matrix column names and metadata GSM:s match
+```{r}
+identical(as.character(colnames(raw_matrix)), as.character(meta_data$geo_accession))
+```
+Save the result in a new file
+```{r}
+write.table(raw_matrix, file = paste0("/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/raw_matrix_ordered_",GSE,".tsv"), sep = "\t", col.names =TRUE)
+```
+
+Load the new file
+```{r}
+raw_matrix_ordered <- read.table(paste0("/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/raw_matrix_ordered_",GSE,".tsv"), 
+                                 sep = "\t", 
+                                 header = TRUE, 
+                                 stringsAsFactors = FALSE)
+```
+
+Remove the Others controls
+```{r}
+# Filter meta_data
+meta_data <- meta_data[!grepl("Others", meta_data$exposure), ]
+
+# Take the samples of interest (looking at the geo_accession)
+valid_samples <- meta_data$geo_accession
+
+# Filter raw_matrix
+raw_matrix_ordered <- raw_matrix_ordered[, valid_samples, drop = FALSE]
+
+dim(raw_matrix_ordered)
+dim(meta_data)
+
+identical(as.character(colnames(raw_matrix_ordered)), as.character(meta_data$geo_accession))
+```
+
+```{r}
+#meta_data$DEG_variables <- paste(meta_data$exposure, meta_data$"dose(amount)", meta_data$"dose(unit)", sep = "_")
+
+meta_data$DEG_variables <- ifelse(
+  grepl("^DMSO", meta_data$sample),
+  "DMSO_0",
+  sapply(strsplit(meta_data$sample, "_"), function(x) paste(x[-length(x)], collapse = "_"))
+)
+
+meta_data$DEG_variables <- gsub("-", ".", meta_data$DEG_variables)
+
+conditions<-(meta_data$DEG_variables)
+table(conditions)
+```
+It is not possible to divide in different batches because for each batch there is a replicate. 
+
+Save the file with the DEG_conditions column
+```{r}
+write.xlsx(meta_data, file = paste0( "/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/updated_",GSE,"_DEG_conditions.xlsx"), sheetName = "Sheet1", rowNames = FALSE)
+```
+
+```{r}
+meta_data <- read.xlsx(paste0( "/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/updated_",GSE,"_DEG_conditions.xlsx"), sheet = 1)
+```
+
+```{r}
+#########################Filter the low counts#############################################
+filter_low_counts <- function(counts.matrix, conditions, method = "cpm", normalized=FALSE, depth=NULL, cpm=1, p.adj = "fdr"){
+  
+  if(is.null(counts.matrix)){stop("Error: please provide a numeric count matrix!")}
+  if(is.null(conditions)){stop("Error: please provide a factor or a vector indicating the conditions!")}
+  if(!method %in% c("cpm", "wilcoxon", "proportion")) {stop("Error: Please type in one of valid methods!")}
+  
+  
+  if (method=="cpm"){
+    filtered.counts = NOISeq::filtered.data(counts.matrix, factor = conditions, norm = normalized, method = 1, cv.cutoff = 100, cpm = cpm, p.adj = p.adj)
+    
+  }else if(method=="wilcoxon"){
+    filtered.counts = NOISeq::filtered.data(counts.matrix, factor = conditions, norm = normalized, method = 2, cv.cutoff = 100, p.adj = p.adj)
+    
+  }else if(method=="proportion"){
+    
+    if(is.null(depth)){stop("Error: indicate a numeric vector indicating per sample library depths")}
+    if(!class(depth)=="numeric"){stop("Error: please provide the depth argument with a numeric vector!")}
+    ### Compute librarary depth
+    
+    
+    filtered.counts = NOISeq::filtered.data(counts.matrix, factor = conditions, norm = normalized, depth = depth, method = 3, cv.cutoff = 100, cpm = cpm, p.adj = p.adj)
+  }
+  return(filtered.counts)
+}
+
+###(Proportion test) performs a proportion test on the counts per condition and feature
+#(or pseudo-counts if data were normalized) where null hypothesis is that the feature relative expression 
+#(count proportion) is equal to cpm/10^6 and higher than cpm/10^6 for the alternative.
+#Those features with p-value greater than 0.05 in all the conditions are removed
+
+filtered_data <- filter_low_counts(counts.matrix = raw_matrix_ordered, conditions = conditions, method = "proportion", normalized = FALSE, p.adj = "fdr", depth = as.numeric(apply(raw_matrix_ordered, 2, sum)))
+
+as.numeric(apply(filtered_data, 2, sum))
+
+write.table(filtered_data, file = paste0( "/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/filtered_raw_expression_matrix_",GSE,".tsv"), sep = "\t", col.names =TRUE)
+
+#########################################################################################################################
+
+```
+
+Compare different transformation methods for PCA
+```{r message = FALSE, warning = FALSE}
+# load the necessary data
+filtered_data <- read.table(paste0( "/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/filtered_raw_expression_matrix_",GSE,".tsv"), 
+                             sep = "\t", 
+                             header = TRUE, 
+                             stringsAsFactors = FALSE)
+
+meta_data <- read.xlsx(paste0( "/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/updated_",GSE,"_DEG_conditions.xlsx"), sheet = 1)
+
+conditions<-(meta_data$DEG_variables)
+filtered_data_as_integer<-sapply(filtered_data,as.integer)
+
+rownames(filtered_data_as_integer) <- rownames(filtered_data)
+
+###########################
+
+colData <- data.frame(condition=as.vector(conditions),sample=as.vector(meta_data$geo_accession), batch = as.factor(meta_data$batch))
+rownames(colData) <- colnames(filtered_data_as_integer)
+
+ddsMat <- DESeq2::DESeqDataSetFromMatrix(countData = filtered_data_as_integer, colData = colData, design = ~batch+condition) 
+
+vsd <- vst(ddsMat, blind = FALSE)
+
+vsd_counts <- assay(vsd)
+write.table(vsd_counts,  file = paste0( "/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/vst_expression_matrix_",GSE,"_Blind_F.tsv"), quote = FALSE, sep = "\t", row.names = TRUE, col=NA)
+
+saveRDS(vsd,file=paste0( "/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/vsd.rds"))
+
+
+# rld <- rlog(ddsMat, blind = FALSE)
+# write.table(rld, file = paste0( "/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/rld_expression_matrix_",GSE,".tsv"), quote = FALSE, sep = "\t", row.names = TRUE, col=NA)
+# ntd <- normTransform(ddsMat)
+# write.table(ntd, file = paste0( "/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/ntd_expression_matrix_",GSE,".tsv"), quote = FALSE, sep = "\t", row.names = TRUE, col=NA)
+
+```
+
+```{r}
+# Read the table with appropriate settings
+vst <- read.table(paste0( "/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/vst_expression_matrix_",GSE,"_Blind_F.tsv"), header = TRUE, sep = "\t", row.names = 1, check.names = FALSE)
+
+```
+
+```{r}
+#RAW COUNTS
+raw_counts <- read.delim(paste0( "/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/filtered_raw_expression_matrix_",GSE,".tsv"), row.names = 1)
+res <- meanSdPlot(as.matrix(raw_counts))
+plot <- res$gg +
+  scale_y_continuous(trans = "log2") +
+  ggtitle("Sd logscale")
+print(plot)
+
+#VST
+vst_matrix <- read.delim(paste0( "/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/vst_expression_matrix_",GSE,"_Blind_F.tsv"), row.names = 1)
+res <- meanSdPlot(as.matrix(vst_matrix))
+plot <- res$gg +
+  ggtitle("VST transformed data")
+print(plot)
+```
+
+```{r}
+# Calculate the variance-stabilized counts on the top 500 most variable genes
+row_variances <- apply(vst, 1, var)
+top_genes <- order(row_variances, decreasing = TRUE)[1:500]
+vst_top <- vst[top_genes, ]
+
+# Perform PCA
+pca <- prcomp(t(vst_top), scale. = TRUE)
+
+# Extract sample names and any grouping variable from meta data
+pca_data <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], sample = meta_data$geo_accession)  
+
+# Plot with ggplot2
+# Plot with ggplot2, without labels
+# Plot with ggplot2, without legend
+ggplot(pca_data, aes(x = PC1, y = PC2, color = sample)) +
+  geom_point(size = 3) +
+  labs(title = "PCA Plot", x = "PC1", y = "PC2") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+```{r}
+pca_data <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], sample = meta_data$geo_accession)
+# Plot with ggplot2, without legend but with labels over each dot
+ggplot(pca_data, aes(x = PC1, y = PC2, color = sample)) +
+  geom_point(size = 3) +
+  geom_text(aes(label = sample), vjust = -1, size = 3) +  # Add labels above each dot
+  labs(title = "PCA Plot", x = "PC1", y = "PC2") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
+```{r}
+# Create a new column to specify if a label should be shown
+# Ensure that `sample` is treated as a character or factor
+pca_data$sample <- as.character(meta_data$geo_accession)  # Convert to character
+
+# Create a new column to specify if a label should be shown
+pca_data$label <- ifelse(pca_data$PC1 < -50 | pca_data$PC1 > 50, pca_data$sample, NA)
+
+# Plot with ggplot2
+ggplot(pca_data, aes(x = PC1, y = PC2, color = sample)) +
+  geom_point(size = 3) +
+  # Only repel labels outside the specified range
+  geom_text_repel(aes(label = label), size = 3, max.overlaps = Inf) +
+  labs(title = "PCA Plot", x = "PC1", y = "PC2") +
+  theme_minimal() +
+  theme(legend.position = "none")
+labeled_gsm <- pca_data$sample[!is.na(pca_data$label)]
+
+# Display the GSM values
+labeled_gsm
+```
+
+```{r}
+pca_data <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], condition = meta_data$DEG_variables)  # Adjust 'sample' as needed
+
+# Plot with ggplot2
+# Plot with ggplot2, without labels
+# Plot with ggplot2, without legend
+ggplot(pca_data, aes(x = PC1, y = PC2, color = condition)) +
+  geom_point(size = 3) +
+  labs(title = "PCA Plot", x = "PC1", y = "PC2") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r}
+# Plot with ggplot2, without legend but with labels over each dot
+ggplot(pca_data, aes(x = PC1, y = PC2, color = condition)) +
+  geom_point(size = 3) +
+  geom_text(aes(label = condition), vjust = -1, size = 3) +  # Add labels above each dot
+  labs(title = "PCA Plot", x = "PC1", y = "PC2") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
+
+```{r}
+column_sums <- apply(filtered_data, 2, sum)
+names(column_sums) <- colnames(filtered_data)  # Assign column names to the sums
+
+# Sort the sums in ascending order and select the lowest 100
+lowest_100_sums <- sort(column_sums)[1:50]
+
+# Convert to a data frame for easy viewing
+lowest_100_df <- data.frame(Sample = names(lowest_100_sums), Sum = lowest_100_sums)
+
+# View the lowest 100 column names and their sums
+lowest_100_df
+```
+
+I will remove outliers from PCA plus what is below 300000 reads the next one has twice the reads and from then on they are considerably more consistent
+```{r}
+low_sum_columns <- names(column_sums[column_sums < 300000])
+
+# Save the result as a list
+low_sum_list <- c(low_sum_columns)
+
+# Display the list
+print(low_sum_list)
+```
+```{r}
+labeled_gsm
+```
+```{r}
+low_sum_list
+```
+```{r}
+outliers<- unique(c(labeled_gsm,low_sum_list))
+```
+
+```{r}
+outliers
+```
+They are: BPAF_0.5_516, BPAF_1_524, DCDPS_1_523, DCDPS_0.5_515.
+They are all from different concentrations, for them I will have 3 replicates instead of 4 but I can maintain them. 
+
+## If there are outliers you have to repeat all the procedure without the outliers.
+
+```{r}
+# Filter out the rows in meta_data that match the labeled GSM values
+meta_data_no_outlier <- meta_data[!meta_data$geo_accession %in% outliers, ]
+
+# Filter out the columns in raw_matrix_ordered that match any of the labeled GSM values
+raw_matrix_no_outlier <- raw_matrix_ordered[, !grepl(paste(outliers, collapse = "|"), colnames(raw_matrix_ordered))]
+```
+
+```{r}
+identical(as.character(colnames(raw_matrix_no_outlier)), as.character(meta_data_no_outlier$geo_accession)) 
+```
+
+```{r}
+
+data.frame(colnames(raw_matrix_no_outlier), meta_data_no_outlier$geo_accession)
+match(colnames(raw_matrix_no_outlier), meta_data_no_outlier$geo_accession)
+###They seem to be reversed
+```
+
+```{r}
+###Lets change the order of the raw data to correspond the metadata. This way the saved data matrices downstream are in the same order
+###as the metadata
+matched_order <- match(meta_data_no_outlier$geo_accession, colnames(raw_matrix_no_outlier))
+
+# Reorder the columns of raw_matrix based on matched_order
+raw_matrix_ordered <- raw_matrix_no_outlier[, matched_order]
+
+# Check if the reordering was successful
+identical(as.character(colnames(raw_matrix_ordered)), as.character(meta_data_no_outlier$geo_accession))
+
+```
+
+```{r}
+conditions<-(meta_data_no_outlier$DEG_variables)
+table(conditions)
+```
+
+
+```{r}
+filtered_data_no_outlier <- filter_low_counts(counts.matrix =raw_matrix_ordered, conditions = conditions, method = "proportion", normalized = FALSE, p.adj = "fdr", depth = as.numeric(apply(raw_matrix_ordered, 2, sum)))
+
+write.table(filtered_data_no_outlier, file = paste0( "/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/filtered_raw_expression_matrix_",GSE,"_no_outlier.tsv"), sep = "\t", col.names =TRUE)
+
+```
+
+```{r}
+write.table(meta_data_no_outlier, 
+            file = paste0( "/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/meta_data_",GSE,"_no_outlier.tsv"),
+            sep = "\t", 
+            col.names = TRUE)
+```
+
+Compare different transformation methods for PCA
+```{r message = FALSE, warning = FALSE}
+filtered_data_no_outlier <- read.table(paste0( "/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/filtered_raw_expression_matrix_",GSE,"_no_outlier.tsv"), 
+                             sep = "\t", 
+                             header = TRUE, 
+                             stringsAsFactors = FALSE)
+
+meta_data_no_outlier <- read.table(
+  file = paste0( "/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/meta_data_",GSE,"_no_outlier.tsv"), 
+  sep = "\t", 
+  header = TRUE, 
+  stringsAsFactors = FALSE
+)
+
+conditions<-(meta_data_no_outlier$DEG_variables)
+
+filtered_data_as_integer<-sapply(filtered_data_no_outlier,as.integer)
+
+rownames(filtered_data_as_integer)<-rownames(filtered_data_no_outlier)
+###########################
+
+colData <- data.frame(condition=as.vector(conditions),sample=as.vector(meta_data_no_outlier$geo_accession), batch = as.factor(meta_data_no_outlier$batch))
+rownames(colData) <- colnames(filtered_data_as_integer)
+
+ddsMat <- DESeq2::DESeqDataSetFromMatrix(countData = filtered_data_as_integer, colData = colData, design = ~batch+condition)
+
+vsd <- vst(ddsMat, blind = FALSE)
+
+vsd_counts <- assay(vsd)
+write.table(vsd_counts,  file = paste0( "/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/vst_expression_matrix_",GSE,"_Blind_F_no_outlier.tsv"), quote = FALSE, sep = "\t", row.names = TRUE, col=NA)
+
+saveRDS(vsd,file=paste0("/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/vsd_no_outlier.rds"))
+
+#----------------------------------------------------------------------------------------------------
+
+# filtered_data_as_integer<-sapply(filtered_data_no_outlier,as.integer)
+# 
+# rownames(filtered_data_as_integer)<-rownames(filtered_data_no_outlier)
+# ###########################
+# 
+# colData <- data.frame(condition=as.vector(conditions),sample=as.vector(meta_data_no_outlier$geo_accession), batch = as.factor(meta_data_no_outlier$batch))
+# rownames(colData) <- colnames(filtered_data_as_integer)
+# 
+# ddsMat <- DESeq2::DESeqDataSetFromMatrix(countData = filtered_data_as_integer, colData = colData, design = ~batch+condition)
+# 
+# vsd_T <- vst(ddsMat, blind = T)
+# 
+# vsd_counts_T <- assay(vsd_T)
+# write.table(vsd_counts_T, file = paste0( "/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/vst_expression_matrix_",GSE,"_Blind_T_no_outlier.tsv"), quote = FALSE, sep = "\t", row.names = TRUE, col=NA)
+# 
+# saveRDS(vsd_T,file=paste0("/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/vsd_T_no_outlier.rds"))
+
+```
+
+```{r}
+# Read the table with appropriate settings
+vst <- read.table(paste0( "/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/vst_expression_matrix_",GSE,"_Blind_F_no_outlier.tsv"), 
+                  header = TRUE, sep = "\t", row.names = 1, check.names = FALSE)
+
+```
+
+```{r}
+#RAW COUNTS
+raw_counts <- read.delim(paste0( "/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/filtered_raw_expression_matrix_",GSE,"_no_outlier.tsv"), row.names = 1)
+res <- meanSdPlot(as.matrix(raw_counts))
+plot <- res$gg +
+  scale_y_continuous(trans = "log2") +
+  ggtitle("Sd logscale")
+ggsave(paste0("/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/variance_not_normalized_data.png"), plot = plot, width = 6, height = 4)
+print(plot)
+
+#VST
+vst_matrix <- read.delim(paste0( "/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/vst_expression_matrix_",GSE,"_Blind_F_no_outlier.tsv"), row.names = 1)
+res <- meanSdPlot(as.matrix(vst_matrix))
+plot <- res$gg +
+  ggtitle("VST transformed data")
+ggsave(paste0("/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/variance_vst_transformed_data.png"), plot = plot, width = 6, height = 4)
+print(plot)
+```
+
+```{r}
+# Calculate the variance-stabilized counts on the top 500 most variable genes
+row_variances <- apply(vst, 1, var)
+top_genes <- order(row_variances, decreasing = TRUE)[1:500]
+vst_top <- vst[top_genes, ]
+
+# Perform PCA
+pca <- prcomp(t(vst_top), scale. = TRUE)
+
+# Extract sample names and any grouping variable from meta data
+pca_data <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], sample = meta_data_no_outlier$geo_accession)  # Adjust 'sample' as needed
+
+# Plot with ggplot2
+# Plot with ggplot2, without labels
+# Plot with ggplot2, without legend
+ggplot(pca_data, aes(x = PC1, y = PC2, color = sample)) +
+  geom_point(size = 3) +
+  labs(title = "PCA Plot", x = "PC1", y = "PC2") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+
+```
+
+
+```{r}
+# Calculate the variance-stabilized counts on the top 5000 most variable genes
+row_variances <- apply(vst, 1, var)
+top_genes <- order(row_variances, decreasing = TRUE)[1:500]
+vst_top <- vst[top_genes, ]
+
+# Perform PCA
+pca <- prcomp(t(vst_top), scale. = TRUE)
+
+# Extract sample names and any grouping variable from meta data
+pca_data <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], condition = meta_data_no_outlier$DEG_variables)  # Adjust 'sample' as needed
+
+# Plot with ggplot2
+# Plot with ggplot2, without labels
+# Plot with ggplot2, without legend
+ggplot(pca_data, aes(x = PC1, y = PC2, color = condition)) +
+  geom_point(size = 3) +
+  labs(title = "PCA Plot", x = "PC1", y = "PC2") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r}
+ggplot(pca_data, aes(x = PC1, y = PC2, color = condition)) +
+  geom_point(size = 3) +
+  geom_text(aes(label = condition), vjust = -1, size = 3) +  # Add labels above each dot
+  labs(title = "PCA Plot", x = "PC1", y = "PC2") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r}
+###############################################################
+
+### Differential expression analysis ###
+
+###############################################################
+
+filtered_data_no_outlier <- read.table(paste0( "/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/filtered_raw_expression_matrix_",GSE,"_no_outlier.tsv"), 
+                             sep = "\t", 
+                             header = TRUE, 
+                             stringsAsFactors = FALSE)
+
+meta_data_no_outlier <- read.table(
+  file = paste0( "/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/meta_data_",GSE,"_no_outlier.tsv"), 
+  sep = "\t", 
+  header = TRUE, 
+  stringsAsFactors = FALSE)
+
+filtered_data_as_integer<-sapply(filtered_data_no_outlier,as.integer)
+rownames(filtered_data_as_integer)<-rownames(filtered_data_no_outlier)
+
+###########################
+```
+
+Since DESeq2 can't process all at once, I divide the data in subsets.
+```{r}
+# make the chemical vector
+chemicals <- unique(sapply(strsplit(meta_data_no_outlier$title, "_"), `[`, 1))
+chemicals <- chemicals[chemicals != "DMSO"]
+```
+
+```{r}
+# select the controls
+control_samples <- meta_data_no_outlier[grepl("DMSO", meta_data_no_outlier$exposure), ]
+
+# iterate on all the chemicals and execute the instructions
+for (chem in chemicals) {
+  cat("\n==== Processing:", chem, "====\n")
+  
+  # Define output directory
+  output_dir <- paste0("/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/",chem,"/")
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+  }
+    
+  # select the samples for that chemical
+  condition_samples <- meta_data_no_outlier[sapply(strsplit(meta_data_no_outlier$title, "_"), `[`, 1) == chem, ]
+  
+  # subset the data
+  meta <- rbind(condition_samples, control_samples)
+  data <- filtered_data_as_integer[, meta$geo_accession, drop = FALSE]
+  
+  conditions<-(meta$DEG_variables)
+  
+  # analysis
+  colData <- data.frame(condition=as.factor(conditions),sample=as.vector(meta$sample), batch = as.factor(meta$batch))
+  colData$condition <- droplevels(colData$condition)
+  rownames(colData) <- colnames(data)
+
+  ddsMat <- DESeq2::DESeqDataSetFromMatrix(countData = data,
+                                         colData = colData,
+                                         design = ~batch+condition) 
+
+  dds <- DESeq2::DESeq(ddsMat)
+  total_norm_counts <- DESeq2::counts(dds, normalized=TRUE)
+  write.table(total_norm_counts, file = paste0( output_dir, "normalized_expression_matrix_",GSE,"_no_outlier_",chem,".tsv"), quote = FALSE, sep = "\t", row.names = TRUE, col=NA)
+  saveRDS(dds,file=paste0(output_dir, "dds_",chem,".rds"))
+  
+  print(table(conditions))
+
+  # Load the data 
+  #dds <- readRDS(file=paste0("/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/dds_",chem,".rds"))
+  #meta_data_no_outlier <- read.table(file = paste0( "/project/omics/public_data/endocrine_disruptors/TempO-Seq_counts/",GSE,"/results/meta_data_",GSE,"_no_outlier.tsv"), sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+  
+  # Filter unique conditions since all have to be compared with the same control group
+  deg_conditions <- meta %>%
+    select(DEG_variables) %>%
+    distinct() %>%
+    filter(DEG_variables != "DMSO_0")
+  
+  # Loop through conditions
+  for (i in seq_len(nrow(deg_conditions))) {
+    condition <- deg_conditions$DEG_variables[i]
+    control <- "DMSO_0"
+  
+    cat(sprintf("\n==== Processing: %s vs %s ====\n", condition, control))
+  
+    # Skip if either condition or control doesn't exist in the dds
+    if (!(condition %in% levels(colData(dds)$condition)) ||
+        !(control %in% levels(colData(dds)$condition))) {
+      warning(sprintf("Skipping %s vs %s: not found in DESeq2 condition levels", condition, control))
+      next
+    }
+  
+    # Define output file names
+    unfiltered_file <- file.path(output_dir, paste0("DEG_results_", condition, "_vs_", control, "_unfiltered_",chem,".tsv"))
+    filtered_file   <- file.path(output_dir, paste0("DEG_results_", condition, "_vs_", control, "_filtered_",chem,".tsv"))
+  
+    # Run DESeq2 contrast
+    res <- results(dds, contrast = c("condition", condition, control),
+                   pAdjustMethod = "fdr", independentFiltering = FALSE)
+  
+    # Save unfiltered results
+    write.table(res, file = unfiltered_file, sep = "\t", row.names = TRUE, quote = FALSE)
+  
+    # Filter by FDR and log2FC
+    res_filtered <- res[which(res$padj <= 0.05 & abs(res$log2FoldChange) >= 0.58), ]
+  
+    cat(sprintf("Filtered DEGs: %d genes for %s vs %s\n", nrow(res_filtered), condition, control))
+  
+    # Save filtered results
+    write.table(res_filtered, file = filtered_file, sep = "\t", row.names = TRUE, quote = FALSE)
+  }
+  
+}
+
+```
